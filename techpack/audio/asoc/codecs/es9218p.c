@@ -453,6 +453,10 @@ int g_ess_rev = ESS_B;
         SNDRV_PCM_FMTBIT_S32_LE | SNDRV_PCM_FMTBIT_S32_BE)
 
 
+#define LGE_ATTR(_name, _mode, _show, _store) \
+struct kobj_attribute lge_attr_##_name = __ATTR(_name, _mode, _show, _store)
+
+
 #ifdef ES9218P_SYSFS
 struct es9218_regmap {
     const char *name;
@@ -555,8 +559,8 @@ struct es9218_regmap {
     { "201_REGISTER",                      ES9219C_REG_201, 1 }, //201_PLL_CONFIG5
 };
 #ifdef CONFIG_SND_SOC_LGE_ESS_DIGITAL_FILTER
-static ssize_t get_fade_term_param(struct device *dev,
-	                    struct device_attribute *attr, char *buf)
+static ssize_t get_fade_term_param(struct kobject *obj,
+	                    struct kobj_attribute *attr, char *buf)
 {
 
 	unsigned val = 1;
@@ -567,8 +571,8 @@ static ssize_t get_fade_term_param(struct device *dev,
 }
 
 
-static ssize_t set_fade_term_param(struct device *dev,
-			 struct device_attribute *attr,
+static ssize_t set_fade_term_param(struct kobject *obj,
+			 struct kobj_attribute *attr,
 			 const char *buf, size_t count)
 {
 
@@ -582,8 +586,8 @@ static ssize_t set_fade_term_param(struct device *dev,
 
 }
 
-static ssize_t get_fade_mute_param(struct device *dev,
-	                    struct device_attribute *attr, char *buf)
+static ssize_t get_fade_mute_param(struct kobject *obj,
+	                    struct kobj_attribute *attr, char *buf)
 {
 
 	unsigned val = 1;
@@ -594,8 +598,8 @@ static ssize_t get_fade_mute_param(struct device *dev,
 }
 
 
-static ssize_t set_fade_mute_param(struct device *dev,
-			 struct device_attribute *attr,
+static ssize_t set_fade_mute_param(struct kobject *obj,
+			 struct kobj_attribute *attr,
 			 const char *buf, size_t count)
 {
 
@@ -609,12 +613,12 @@ static ssize_t set_fade_mute_param(struct device *dev,
 
 }
 
-static DEVICE_ATTR(fade_mute_count, S_IWUSR | S_IRUGO, get_fade_mute_param, set_fade_mute_param);
-static DEVICE_ATTR(fade_mute_term, S_IWUSR | S_IRUGO, get_fade_term_param, set_fade_term_param);
+static LGE_ATTR(fade_mute_count, S_IWUSR | S_IRUGO, get_fade_mute_param, set_fade_mute_param);
+static LGE_ATTR(fade_mute_term, S_IWUSR | S_IRUGO, get_fade_term_param, set_fade_term_param);
 #endif
 
-static ssize_t es9218_registers_show(struct device *dev,
-                  struct device_attribute *attr, char *buf)
+static ssize_t es9218_registers_show(struct kobject *obj,
+                  struct kobj_attribute *attr, char *buf)
 {
     unsigned i, n, reg_count;
     u8 read_buf;
@@ -631,8 +635,8 @@ static ssize_t es9218_registers_show(struct device *dev,
     return n;
 }
 
-static ssize_t es9218_registers_store(struct device *dev,
-                   struct device_attribute *attr,
+static ssize_t es9218_registers_store(struct kobject *obj,
+                   struct kobj_attribute *attr,
                    const char *buf, size_t count)
 {
     unsigned i, reg_count, value;
@@ -674,15 +678,15 @@ static ssize_t es9218_registers_store(struct device *dev,
     return -1;
 }
 
-static DEVICE_ATTR(registers, S_IWUSR | S_IRUGO,
+static LGE_ATTR(registers, S_IWUSR | S_IRUGO,
         es9218_registers_show, es9218_registers_store);
 
 static struct attribute *es9218_attrs[] = {
 #ifdef CONFIG_SND_SOC_LGE_ESS_DIGITAL_FILTER
-	&dev_attr_fade_mute_count.attr,
-	&dev_attr_fade_mute_term.attr,
+	&lge_attr_fade_mute_count.attr,
+	&lge_attr_fade_mute_term.attr,
 #endif
-    &dev_attr_registers.attr,
+    &lge_attr_registers.attr,
     NULL
 };
 
