@@ -1,5 +1,30 @@
 ifeq ($(CONFIG_BUILD_ARM64_DT_OVERLAY),y)
 # Per Platform
+ifeq ($(CONFIG_MACH_KONA_TIMELM),y)
+DTS_PROJECT := kona-timelm
+endif
+
+# Per Device
+ifeq ($(CONFIG_MACH_KONA_TIMELM_LAO_LDU),y)
+DTS_TARGET := kona-timelm_lao_ldu
+endif
+
+# Per Device
+ifeq ($(CONFIG_MACH_KONA_TIMELM_LAO_COM),y)
+DTS_TARGET := kona-timelm_lao_com
+endif
+
+# Per Device
+ifeq ($(CONFIG_MACH_KONA_TIMELM_DCM_JP),y)
+DTS_TARGET := kona-timelm_dcm_jp
+endif
+
+# Per Device
+ifeq ($(CONFIG_MACH_KONA_TIMELM_SB_JP),y)
+DTS_TARGET := kona-timelm_sb_jp
+endif
+
+# Per Platform
 ifeq ($(CONFIG_MACH_LITO_CAYMANLM),y)
 DTS_PROJECT := lito-caymanlm
 endif
