@@ -14,6 +14,7 @@ struct device;
 #define SYS_POWER_OFF	0x0003	/* Notify of system power off */
 
 enum reboot_mode {
+	REBOOT_UNDEFINED = -1,
 	REBOOT_COLD = 0,
 	REBOOT_WARM,
 	REBOOT_HARD,
@@ -21,6 +22,7 @@ enum reboot_mode {
 	REBOOT_GPIO,
 };
 extern enum reboot_mode reboot_mode;
+extern enum reboot_mode panic_reboot_mode;
 
 enum reboot_type {
 	BOOT_TRIPLE	= 't',
@@ -56,6 +58,11 @@ extern void machine_restart(char *cmd);
 extern void machine_halt(void);
 extern void machine_power_off(void);
 
+#ifdef CONFIG_LGE_POWEROFF_TIMEOUT
+extern void machine_restart_timeout(char *cmd);
+extern void machine_power_off_timeout(void);
+#endif
+
 extern void machine_shutdown(void);
 struct pt_regs;
 extern void machine_crash_shutdown(struct pt_regs *);
@@ -68,6 +75,11 @@ extern void kernel_restart_prepare(char *cmd);
 extern void kernel_restart(char *cmd);
 extern void kernel_halt(void);
 extern void kernel_power_off(void);
+
+#ifdef CONFIG_LGE_POWEROFF_TIMEOUT
+extern void kernel_restart_timeout(char *cmd);
+extern void kernel_power_off_timeout(void);
+#endif
 
 extern int C_A_D; /* for sysctl */
 void ctrl_alt_del(void);

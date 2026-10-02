@@ -181,6 +181,11 @@ static void delayed_put_task_struct(struct rcu_head *rhp)
 	put_task_struct(tsk);
 }
 
+void put_task_struct_rcu_user(struct task_struct *task)
+{
+	if (refcount_dec_and_test(&task->rcu_users))
+		call_rcu(&task->rcu, delayed_put_task_struct);
+}
 
 void release_task(struct task_struct *p)
 {
@@ -221,7 +226,7 @@ repeat:
 
 	write_unlock_irq(&tasklist_lock);
 	release_thread(p);
-	call_rcu(&p->rcu, delayed_put_task_struct);
+	put_task_struct_rcu_user(p);
 
 	p = leader;
 	if (unlikely(zap_leader))
@@ -715,6 +720,7 @@ static void exit_notify(struct task_struct *tsk, int group_dead)
 	if (group_dead)
 		kill_orphaned_pgrp(tsk->group_leader, NULL);
 
+	tsk->exit_state = EXIT_ZOMBIE;
 	if (unlikely(tsk->ptrace)) {
 		int sig = thread_group_leader(tsk) &&
 				thread_group_empty(tsk) &&
@@ -771,6 +777,13 @@ void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
 	int group_dead;
+
+#ifdef CONFIG_MACH_LGE
+	if(task_pid_nr(current)==1) {
+		panic("current pid is init!!!  exitcode=0x%08x\n",
+				tsk->signal->group_exit_code ?: tsk->exit_code);
+	}
+#endif
 
 	/*
 	 * We can get here from a kernel oops, sometimes with preemption off.
@@ -830,6 +843,7 @@ void __noreturn do_exit(long code)
 	}
 
 	exit_signals(tsk);  /* sets PF_EXITING */
+	sched_exit(tsk);
 	/*
 	 * Ensure that all new tsk->pi_lock acquisitions must observe
 	 * PF_EXITING. Serializes against futex.c:attach_to_pi_owner().

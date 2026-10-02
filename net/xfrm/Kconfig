@@ -27,6 +27,17 @@ config XFRM_USER
 
 	  If unsure, say Y.
 
+config XFRM_USER_COMPAT
+	tristate "Compatible ABI support"
+	depends on XFRM_USER && COMPAT_FOR_U64_ALIGNMENT && \
+		HAVE_EFFICIENT_UNALIGNED_ACCESS
+	select WANT_COMPAT_NETLINK_MESSAGES
+	help
+	  Transformation(XFRM) user configuration interface like IPsec
+	  used by compatible Linux applications.
+
+	  If unsure, say N.
+
 config XFRM_INTERFACE
 	tristate "Transformation virtual interface"
 	depends on XFRM && IPV6
@@ -97,3 +108,12 @@ config NET_KEY_MIGRATE
 	  <draft-sugimoto-mip6-pfkey-migrate>.
 
 	  If unsure, say N.
+
+# 2018-03-16 gihong.jang@lge.com LGP_DATA_KERNEL_XFRM_FRAG_ESP [START]
+config XFRM_FRAG_ESP_BEFORE_TUNNEL_ENC
+ bool "Fragment ipv6 ESP(transport) before tunnel mode encryption."
+ ---help---
+    This will fragment ipv6 transport mode encrypted packet
+    before processing tunnel mode encryption.
+# 2018-03-16 gihong.jang@lge.com LGP_DATA_KERNEL_XFRM_FRAG_ESP [END]
+

@@ -31,6 +31,7 @@ EXPORT_SYMBOL(cad_pid);
 #define DEFAULT_REBOOT_MODE
 #endif
 enum reboot_mode reboot_mode DEFAULT_REBOOT_MODE;
+enum reboot_mode panic_reboot_mode = REBOOT_UNDEFINED;
 
 /*
  * This variable is used privately to keep track of whether or not
@@ -252,6 +253,13 @@ void kernel_restart(char *cmd)
 }
 EXPORT_SYMBOL_GPL(kernel_restart);
 
+#ifdef CONFIG_LGE_POWEROFF_TIMEOUT
+void kernel_restart_timeout(char *cmd)
+{
+	machine_restart_timeout(cmd);
+}
+#endif
+
 static void kernel_shutdown_prepare(enum system_states state)
 {
 	blocking_notifier_call_chain(&reboot_notifier_list,
@@ -294,6 +302,12 @@ void kernel_power_off(void)
 }
 EXPORT_SYMBOL_GPL(kernel_power_off);
 
+#ifdef CONFIG_LGE_POWEROFF_TIMEOUT
+void kernel_power_off_timeout(void)
+{
+	machine_power_off_timeout();
+}
+#endif
 DEFINE_MUTEX(system_transition_mutex);
 
 /*
@@ -372,6 +386,23 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 
 		kernel_restart(buffer);
 		break;
+
+#ifdef CONFIG_LGE_POWEROFF_TIMEOUT
+	case LINUX_REBOOT_CMD_POWER_OFF_TIMEOUT:
+		kernel_power_off_timeout();
+		break;
+
+	case LINUX_REBOOT_CMD_RESTART2_TIMEOUT:
+		ret = strncpy_from_user(&buffer[0], arg, sizeof(buffer) - 1);
+		if (ret < 0) {
+			ret = -EFAULT;
+			break;
+		}
+		buffer[sizeof(buffer) - 1] = '\0';
+
+		kernel_restart_timeout(buffer);
+		break;
+#endif
 
 #ifdef CONFIG_KEXEC_CORE
 	case LINUX_REBOOT_CMD_KEXEC:
@@ -518,6 +549,8 @@ EXPORT_SYMBOL_GPL(orderly_reboot);
 static int __init reboot_setup(char *str)
 {
 	for (;;) {
+		enum reboot_mode *mode;
+
 		/*
 		 * Having anything passed on the command line via
 		 * reboot= will cause us to disable DMI checking
@@ -525,17 +558,24 @@ static int __init reboot_setup(char *str)
 		 */
 		reboot_default = 0;
 
+		if (!strncmp(str, "panic_", 6)) {
+			mode = &panic_reboot_mode;
+			str += 6;
+		} else {
+			mode = &reboot_mode;
+		}
+
 		switch (*str) {
 		case 'w':
-			reboot_mode = REBOOT_WARM;
+			*mode = REBOOT_WARM;
 			break;
 
 		case 'c':
-			reboot_mode = REBOOT_COLD;
+			*mode = REBOOT_COLD;
 			break;
 
 		case 'h':
-			reboot_mode = REBOOT_HARD;
+			*mode = REBOOT_HARD;
 			break;
 
 		case 's':
@@ -552,11 +592,11 @@ static int __init reboot_setup(char *str)
 				if (rc)
 					return rc;
 			} else
-				reboot_mode = REBOOT_SOFT;
+				*mode = REBOOT_SOFT;
 			break;
 		}
 		case 'g':
-			reboot_mode = REBOOT_GPIO;
+			*mode = REBOOT_GPIO;
 			break;
 
 		case 'b':

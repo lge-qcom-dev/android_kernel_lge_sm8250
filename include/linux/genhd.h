@@ -17,6 +17,7 @@
 #include <linux/percpu-refcount.h>
 #include <linux/uuid.h>
 #include <linux/blk_types.h>
+#include <linux/android_kabi.h>
 
 #ifdef CONFIG_BLOCK
 
@@ -130,6 +131,11 @@ struct hd_struct {
 #endif
 	struct percpu_ref ref;
 	struct rcu_work rcu_work;
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 
 #define GENHD_FL_REMOVABLE			1
@@ -143,6 +149,10 @@ struct hd_struct {
 #define GENHD_FL_BLOCK_EVENTS_ON_EXCL_WRITE	256
 #define GENHD_FL_NO_PART_SCAN			512
 #define GENHD_FL_HIDDEN				1024
+
+#ifdef CONFIG_LFS_SCSI_USB_HOST_NOTIFY
+#define GENHD_IF_USB	1
+#endif
 
 enum {
 	DISK_EVENT_MEDIA_CHANGE			= 1 << 0, /* media changed */
@@ -167,6 +177,9 @@ struct blk_integrity {
 	unsigned char				tuple_size;
 	unsigned char				interval_exp;
 	unsigned char				tag_size;
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
 };
 
 #endif	/* CONFIG_BLK_DEV_INTEGRITY */
@@ -211,6 +224,16 @@ struct gendisk {
 	int node_id;
 	struct badblocks *bb;
 	struct lockdep_map lockdep_map;
+
+#ifdef CONFIG_LFS_SCSI_USB_HOST_NOTIFY
+	int media_present;
+	int interfaces;
+#endif
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
+
 };
 
 static inline struct gendisk *part_to_disk(struct hd_struct *part)

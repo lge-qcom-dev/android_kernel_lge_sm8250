@@ -43,9 +43,14 @@ struct pr_ops;
 struct rq_qos;
 struct blk_queue_stats;
 struct blk_stat_callback;
+struct keyslot_manager;
 
 #define BLKDEV_MIN_RQ	4
+#ifdef CONFIG_LFS_BLOCK_RQ
+#define BLKDEV_MAX_RQ	256	/* Default maximum */
+#else
 #define BLKDEV_MAX_RQ	128	/* Default maximum */
+#endif
 
 /* Must be consistent with blk_mq_poll_stats_bkt() */
 #define BLK_MQ_POLL_STATS_BKTS 16
@@ -127,6 +132,8 @@ typedef __u32 __bitwise req_flags_t;
 #define RQF_MQ_POLL_SLEPT	((__force req_flags_t)(1 << 20))
 /* ->timeout has been called, don't expire again */
 #define RQF_TIMED_OUT		((__force req_flags_t)(1 << 21))
+/* increased nr_pending for this request */
+#define RQF_PM_ADDED		((__force req_flags_t)(1 << 22))
 
 /* flags that prevent us from merging requests: */
 #define RQF_NOMERGE_FLAGS \
@@ -574,6 +581,10 @@ struct request_queue {
 	 * queue_lock internally, e.g. scsi_request_fn().
 	 */
 	unsigned int		request_fn_active;
+#ifdef CONFIG_BLK_INLINE_ENCRYPTION
+	/* Inline crypto capabilities */
+	struct keyslot_manager *ksm;
+#endif
 
 	unsigned int		rq_timeout;
 	int			poll_nsec;
@@ -641,10 +652,8 @@ struct request_queue {
 	int			bypass_depth;
 	atomic_t		mq_freeze_depth;
 
-#if defined(CONFIG_BLK_DEV_BSG)
 	bsg_job_fn		*bsg_job_fn;
 	struct bsg_class_device bsg_dev;
-#endif
 
 #ifdef CONFIG_BLK_DEV_THROTTLING
 	/* Throttle data */

@@ -44,6 +44,9 @@
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
+#ifdef CONFIG_LFS_MMC
+#include <linux/mmc/slot-gpio.h>
+#endif
 
 #include <linux/uaccess.h>
 
@@ -51,6 +54,7 @@
 #include "block.h"
 #include "core.h"
 #include "card.h"
+#include "crypto.h"
 #include "host.h"
 #include "bus.h"
 #include "mmc_ops.h"
@@ -120,6 +124,7 @@ struct mmc_blk_data {
 #define MMC_BLK_DISCARD		BIT(2)
 #define MMC_BLK_SECDISCARD	BIT(3)
 #define MMC_BLK_CQE_RECOVERY	BIT(4)
+#define MMC_BLK_PARTSWITCH     BIT(5)
 
 	/*
 	 * Only set in main mmc_blk_data associated
@@ -210,8 +215,12 @@ static ssize_t power_ro_lock_show(struct device *dev,
 {
 	int ret;
 	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
-	struct mmc_card *card = md->queue.card;
+	struct mmc_card *card;
 	int locked = 0;
+	if (!md)
+		return -EINVAL;
+
+	card = md->queue.card;
 
 	if (card->ext_csd.boot_ro_lock & EXT_CSD_BOOT_WP_B_PERM_WP_EN)
 		locked = 2;
@@ -241,6 +250,8 @@ static ssize_t power_ro_lock_store(struct device *dev,
 		return count;
 
 	md = mmc_blk_get(dev_to_disk(dev));
+	if (!md)
+		return -EINVAL;
 	mq = &md->queue;
 
 	/* Dispatch locking to the block layer */
@@ -275,6 +286,8 @@ static ssize_t force_ro_show(struct device *dev, struct device_attribute *attr,
 {
 	int ret;
 	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
+	if (!md)
+		return -EINVAL;
 
 	ret = snprintf(buf, PAGE_SIZE, "%d\n",
 		       get_disk_ro(dev_to_disk(dev)) ^
@@ -290,6 +303,9 @@ static ssize_t force_ro_store(struct device *dev, struct device_attribute *attr,
 	char *end;
 	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
 	unsigned long set = simple_strtoul(buf, &end, 0);
+	if (!md)
+		return -EINVAL;
+
 	if (end == buf) {
 		ret = -EINVAL;
 		goto out;
@@ -306,6 +322,9 @@ static int mmc_blk_open(struct block_device *bdev, fmode_t mode)
 {
 	struct mmc_blk_data *md = mmc_blk_get(bdev->bd_disk);
 	int ret = -ENXIO;
+	if (!md)
+		return -EINVAL;
+
 
 	mutex_lock(&block_mutex);
 	if (md) {
@@ -413,11 +432,12 @@ static int ioctl_do_sanitize(struct mmc_card *card)
 {
 	int err;
 
-	if (!mmc_can_sanitize(card)) {
-			pr_warn("%s: %s - SANITIZE is not supported\n",
-				mmc_hostname(card->host), __func__);
-			err = -EOPNOTSUPP;
-			goto out;
+	if (!mmc_can_sanitize(card) &&
+			(card->host->caps2 & MMC_CAP2_SANITIZE)) {
+		pr_warn("%s: %s - SANITIZE is not supported\n",
+			mmc_hostname(card->host), __func__);
+		err = -EOPNOTSUPP;
+		goto out;
 	}
 
 	pr_debug("%s: %s - SANITIZE IN PROGRESS...\n",
@@ -631,7 +651,7 @@ static int __mmc_blk_ioctl_cmd(struct mmc_card *card, struct mmc_blk_data *md,
 
 	memcpy(&(idata->ic.response), cmd.resp, sizeof(cmd.resp));
 
-	if (idata->rpmb || (cmd.flags & MMC_RSP_R1B)) {
+	if (idata->rpmb || (cmd.flags & MMC_RSP_BUSY)) {
 		/*
 		 * Ensure RPMB/R1B command has completed by polling CMD13
 		 * "Send Status".
@@ -654,13 +674,13 @@ static int mmc_blk_ioctl_cmd(struct mmc_blk_data *md,
 	struct request *req;
 
 	idata = mmc_blk_ioctl_copy_from_user(ic_ptr);
-	if (IS_ERR(idata))
+	if (IS_ERR_OR_NULL(idata))
 		return PTR_ERR(idata);
 	/* This will be NULL on non-RPMB ioctl():s */
 	idata->rpmb = rpmb;
 
 	card = md->queue.card;
-	if (IS_ERR(card)) {
+	if (IS_ERR_OR_NULL(card)) {
 		err = PTR_ERR(card);
 		goto cmd_done;
 	}
@@ -871,7 +891,8 @@ static inline int mmc_blk_part_switch(struct mmc_card *card,
 	int ret = 0;
 	struct mmc_blk_data *main_md = dev_get_drvdata(&card->dev);
 
-	if (main_md->part_curr == part_type)
+	if ((main_md->part_curr == part_type) &&
+		(card->part_curr == part_type))
 		return 0;
 
 	if (mmc_card_mmc(card)) {
@@ -888,11 +909,15 @@ static inline int mmc_blk_part_switch(struct mmc_card *card,
 				 EXT_CSD_PART_CONFIG, part_config,
 				 card->ext_csd.part_time);
 		if (ret) {
+			pr_err("%s: %s: switch failure, %d -> %d\n",
+				mmc_hostname(card->host), __func__,
+				main_md->part_curr, part_type);
 			mmc_blk_part_switch_post(card, part_type);
 			return ret;
 		}
 
 		card->ext_csd.part_config = part_config;
+		card->part_curr = part_type;
 
 		ret = mmc_blk_part_switch_post(card, main_md->part_curr);
 	}
@@ -1304,6 +1329,8 @@ static void mmc_blk_data_prep(struct mmc_queue *mq, struct mmc_queue_req *mqrq,
 
 	memset(brq, 0, sizeof(struct mmc_blk_request));
 
+	mmc_crypto_prepare_req(mqrq);
+
 	brq->mrq.data = &brq->data;
 	brq->mrq.tag = req->tag;
 
@@ -1428,6 +1455,7 @@ static void mmc_blk_cqe_complete_rq(struct mmc_queue *mq, struct request *req)
 	unsigned long flags;
 	bool put_card;
 	int err;
+	bool is_dcmd = false;
 
 	mmc_cqe_post_req(host, mrq);
 
@@ -1455,15 +1483,20 @@ static void mmc_blk_cqe_complete_rq(struct mmc_queue *mq, struct request *req)
 	spin_lock_irqsave(q->queue_lock, flags);
 
 	mq->in_flight[issue_type] -= 1;
+	atomic_dec(&host->active_reqs);
 
 	put_card = (mmc_tot_in_flight(mq) == 0);
 
 	mmc_cqe_check_busy(mq);
 
+	is_dcmd = (mmc_issue_type(mq, req) ==  MMC_ISSUE_DCMD);
+
 	spin_unlock_irqrestore(q->queue_lock, flags);
 
 	if (!mq->cqe_busy)
 		blk_mq_run_hw_queues(q, true);
+
+	mmc_cqe_clk_scaling_stop_busy(host, true, is_dcmd);
 
 	if (put_card)
 		mmc_put_card(mq->card, &mq->ctx);
@@ -1478,10 +1511,10 @@ void mmc_blk_cqe_recovery(struct mmc_queue *mq)
 	pr_debug("%s: CQE recovery start\n", mmc_hostname(host));
 
 	err = mmc_cqe_recovery(host);
-	if (err)
+	if (err || host->need_hw_reset)
 		mmc_blk_reset(mq->blkdata, host, MMC_BLK_CQE_RECOVERY);
-	else
-		mmc_blk_reset_success(mq->blkdata, MMC_BLK_CQE_RECOVERY);
+	mmc_blk_reset_success(mq->blkdata, MMC_BLK_CQE_RECOVERY);
+	host->need_hw_reset = false;
 
 	pr_debug("%s: CQE recovery done\n", mmc_hostname(host));
 }
@@ -1543,10 +1576,39 @@ static int mmc_blk_cqe_issue_flush(struct mmc_queue *mq, struct request *req)
 static int mmc_blk_cqe_issue_rw_rq(struct mmc_queue *mq, struct request *req)
 {
 	struct mmc_queue_req *mqrq = req_to_mmc_queue_req(req);
+	struct mmc_card *card = mq->card;
+	struct mmc_host *host = card->host;
+	int err = 0;
 
 	mmc_blk_data_prep(mq, mqrq, 0, NULL, NULL);
 
-	return mmc_blk_cqe_start_req(mq->card->host, &mqrq->brq.mrq);
+	mmc_deferred_scaling(mq->card->host);
+	mmc_cqe_clk_scaling_start_busy(mq, mq->card->host, true);
+	/*
+	 * When voltage corner in LSVS on low load scenario and
+	 * there is sudden burst of requests device queue all
+	 * slots are filled and it is needed to wait till all
+	 * requests are completed to scale up frequency. This
+	 * is leading to delay in scaling and impacting performance.
+	 * Fix this issue by only allowing one request in request queue
+	 * when device is running with lower speed mode.
+	 */
+	if (host->clk_scaling.state == MMC_LOAD_LOW) {
+		err = host->cqe_ops->cqe_wait_for_idle(host);
+		if (err) {
+			pr_err("%s: %s: CQE went in recovery path.\n",
+				mmc_hostname(host), __func__);
+			goto stop_scaling;
+		}
+	}
+
+	err =  mmc_blk_cqe_start_req(mq->card->host, &mqrq->brq.mrq);
+
+stop_scaling:
+	if (err)
+		mmc_cqe_clk_scaling_stop_busy(mq->card->host, true, false);
+
+	return err;
 }
 
 static void mmc_blk_rw_rq_prep(struct mmc_queue_req *mqrq,
@@ -1659,31 +1721,31 @@ static void mmc_blk_read_single(struct mmc_queue *mq, struct request *req)
 	struct mmc_card *card = mq->card;
 	struct mmc_host *host = card->host;
 	blk_status_t error = BLK_STS_OK;
-	int retries = 0;
 
 	do {
 		u32 status;
 		int err;
+		int retries = 0;
 
-		mmc_blk_rw_rq_prep(mqrq, card, 1, mq);
+		while (retries++ <= MMC_READ_SINGLE_RETRIES) {
+			mmc_blk_rw_rq_prep(mqrq, card, 1, mq);
 
-		mmc_wait_for_req(host, mrq);
+			mmc_wait_for_req(host, mrq);
 
-		err = mmc_send_status(card, &status);
-		if (err)
-			goto error_exit;
-
-		if (!mmc_host_is_spi(host) &&
-		    !mmc_blk_in_tran_state(status)) {
-			err = mmc_blk_fix_state(card, req);
+			err = mmc_send_status(card, &status);
 			if (err)
 				goto error_exit;
+
+			if (!mmc_host_is_spi(host) &&
+			    !mmc_blk_in_tran_state(status)) {
+				err = mmc_blk_fix_state(card, req);
+				if (err)
+					goto error_exit;
+			}
+
+			if (!mrq->cmd->error)
+				break;
 		}
-
-		if (mrq->cmd->error && retries++ < MMC_READ_SINGLE_RETRIES)
-			continue;
-
-		retries = 0;
 
 		if (mrq->cmd->error ||
 		    mrq->data->error ||
@@ -1816,6 +1878,8 @@ static void mmc_blk_mq_rw_recovery(struct mmc_queue *mq, struct request *req)
 	    err && mmc_blk_reset(md, card->host, type)) {
 		pr_err("%s: recovery failed!\n", req->rq_disk->disk_name);
 		mqrq->retries = MMC_NO_RETRIES;
+		if (mmc_card_sd(card))
+			mmc_card_set_removed(card);
 		return;
 	}
 
@@ -1958,12 +2022,14 @@ static void mmc_blk_mq_poll_completion(struct mmc_queue *mq,
 static void mmc_blk_mq_dec_in_flight(struct mmc_queue *mq, struct request *req)
 {
 	struct request_queue *q = req->q;
+	struct mmc_host *host = mq->card->host;
 	unsigned long flags;
 	bool put_card;
 
 	spin_lock_irqsave(q->queue_lock, flags);
 
 	mq->in_flight[mmc_issue_type(mq, req)] -= 1;
+	atomic_dec(&host->active_reqs);
 
 	put_card = (mmc_tot_in_flight(mq) == 0);
 
@@ -2191,10 +2257,22 @@ enum mmc_issued mmc_blk_mq_issue_rq(struct mmc_queue *mq, struct request *req)
 	struct mmc_card *card = md->queue.card;
 	struct mmc_host *host = card->host;
 	int ret;
+	int err;
 
 	ret = mmc_blk_part_switch(card, md->part_type);
-	if (ret)
+	if (ret) {
+		err = mmc_blk_reset(md, card->host, MMC_BLK_PARTSWITCH);
+		if (!err) {
+			pr_err("%s: mmc_blk_reset(MMC_BLK_PARTSWITCH) succeeded.\n",
+					mmc_hostname(card->host));
+			mmc_blk_reset_success(md, MMC_BLK_PARTSWITCH);
+		} else {
+			pr_err("%s: mmc_blk_reset(MMC_BLK_PARTSWITCH) failed.\n",
+					mmc_hostname(card->host));
+		}
+
 		return MMC_REQ_FAILED_TO_START;
+	}
 
 	switch (mmc_issue_type(mq, req)) {
 	case MMC_ISSUE_SYNC:
@@ -2239,7 +2317,11 @@ enum mmc_issued mmc_blk_mq_issue_rq(struct mmc_queue *mq, struct request *req)
 		}
 		if (!ret)
 			return MMC_REQ_STARTED;
-		return ret == -EBUSY ? MMC_REQ_BUSY : MMC_REQ_FAILED_TO_START;
+
+		if (ret == -EBUSY)
+			return MMC_REQ_BUSY;
+
+		return MMC_REQ_FAILED_TO_START;
 	default:
 		WARN_ON_ONCE(1);
 		return MMC_REQ_FAILED_TO_START;
@@ -2738,24 +2820,41 @@ static int mmc_dbg_card_status_get(void *data, u64 *val)
 }
 DEFINE_SIMPLE_ATTRIBUTE(mmc_dbg_card_status_fops, mmc_dbg_card_status_get,
 		NULL, "%08llx\n");
-
+#ifdef CONFIG_LFS_MMC
+static int mmc_ext_csd_read(struct seq_file *s, void *data)
+#else
 /* That is two digits * 512 + 1 for newline */
 #define EXT_CSD_STR_LEN 1025
 
 static int mmc_ext_csd_open(struct inode *inode, struct file *filp)
+#endif
 {
+#ifdef CONFIG_LFS_MMC
+	struct mmc_card *card = s->private;
+#else
 	struct mmc_card *card = inode->i_private;
+	char *buf;
+	ssize_t n = 0;
+#endif
 	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
 	struct mmc_queue *mq = &md->queue;
 	struct request *req;
-	char *buf;
-	ssize_t n = 0;
-	u8 *ext_csd;
+	u8 *ext_csd = NULL;
+#ifdef CONFIG_LFS_MMC
+	u8 ext_csd_rev;
+	int err;
+	const char *str;
+	char *buf_for_health_report;
+	char *buf_for_firmwware_version;
+	ssize_t output = 0;
+	int cnt;
+#else
 	int err, i;
 
 	buf = kmalloc(EXT_CSD_STR_LEN + 1, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
+#endif
 
 	/* Ask the block layer for the EXT CSD */
 	req = blk_get_request(mq->queue, REQ_OP_DRV_IN, 0);
@@ -2772,6 +2871,10 @@ static int mmc_ext_csd_open(struct inode *inode, struct file *filp)
 		pr_err("FAILED %d\n", err);
 		goto out_free;
 	}
+#ifdef CONFIG_LFS_MMC
+
+	ext_csd_rev = ext_csd[192];
+#else
 
 	for (i = 0; i < 512; i++)
 		n += sprintf(buf + n, "%02x", ext_csd[i]);
@@ -2786,15 +2889,249 @@ static int mmc_ext_csd_open(struct inode *inode, struct file *filp)
 	filp->private_data = buf;
 	kfree(ext_csd);
 	return 0;
+#endif
 
+#ifdef CONFIG_LFS_MMC
+	switch (ext_csd_rev) {
+		case 8:
+			str = "5.1";
+			break;
+	case 7:
+	       str = "5.0";
+	       break;
+       case 6:
+               str = "4.5";
+               break;
+       case 5:
+               str = "4.41";
+               break;
+       case 3:
+               str = "4.3";
+               break;
+       case 2:
+               str = "4.2";
+               break;
+       case 1:
+               str = "4.1";
+               break;
+       case 0:
+               str = "4.0";
+               break;
+       default:
+               goto out_free;
+       }
+       seq_printf(s, "Extended CSD rev 1.%d (MMC %s)\n", ext_csd_rev, str);
+       if (ext_csd_rev < 3)
+               goto out_free; /* No ext_csd */
+	if (ext_csd_rev >= 7) {
+		seq_printf(s, "[505] Extended Security Commands Error, ext_security_err: 0x%02x\n", ext_csd[505]);
+	}
+       seq_printf(s, "[504] Supported Command Sets, s_cmd_set: 0x%02x\n", ext_csd[504]);
+       seq_printf(s, "[503] HPI features, hpi_features: 0x%02x\n", ext_csd[503]);
+       seq_printf(s, "[502] Background operations support, bkops_support: 0x%02x\n", ext_csd[502]);
+       if (ext_csd_rev >= 6) {
+		seq_printf(s, "[501] Max packed read commands, max_packed_reads: 0x%02x\n", ext_csd[501]);
+		seq_printf(s, "[500] Max packed write commands, max_packed_writes: 0x%02x\n", ext_csd[500]);
+		seq_printf(s, "[499] Data Tag Support, data_tag_support: 0x%02x\n", ext_csd[499]);
+		seq_printf(s, "[498] Tag Unit Size, tag_unit_size: 0x%02x\n", ext_csd[498]);
+		seq_printf(s, "[497] Tag Resources Size, tag_res_size: 0x%02x\n", ext_csd[497]);
+		seq_printf(s, "[496] Context management capabilities, context_capabilities: 0x%02x\n", ext_csd[496]);
+		seq_printf(s, "[495] Large Unit size, large_unit_size_m1: 0x%02x\n", ext_csd[495]);
+		seq_printf(s, "[494] Extended partitions attribute support, ext_support: 0x%02x\n", ext_csd[494]);
+		if (ext_csd_rev >= 7) {
+			buf_for_health_report = kmalloc(66, GFP_KERNEL);
+			if (!buf_for_health_report)
+				return -ENOMEM;
+			buf_for_firmwware_version = kmalloc(18, GFP_KERNEL);
+			if (!buf_for_firmwware_version) {
+				kfree(buf_for_health_report);
+				return -ENOMEM;
+			}
+			seq_printf(s, "[493] Supported modes, supported_modes: 0x%02x\n", ext_csd[493]);
+			seq_printf(s, "[492] FFU features, FFU_FEATURES: 0x%02x\n", ext_csd[492]);
+			seq_printf(s, "[491] Operation codes timeout, operation_code_timeout: 0x%02x\n", ext_csd[491]);
+			seq_printf(s, "[490:487] FFU Argument, FFU_ARG: 0x%08x\n", (ext_csd[487] << 0) | (ext_csd[488] << 8) | (ext_csd[489] << 16) | (ext_csd[490] << 24));
+			/* B50: reserved [486:306] */
+			seq_printf(s, "[305:302] Number of FW sectors correctly programmed, number_of_fw_sectors_correctly_programmed: 0x%x\n", (ext_csd[302] << 0) | (ext_csd[303] << 8) | (ext_csd[304] << 16) | (ext_csd[305] << 24));
+
+			output = 0;
+			for (cnt = 301 ; cnt >= 270 ; cnt--)
+				output += snprintf(buf_for_health_report + output, 3, "%02x", ext_csd[cnt]);
+			output += snprintf(buf_for_health_report + output, 2, "\n");
+			seq_printf(s, "[301:270] Vendor proprietary health report, vendor_proprietary_health_report: %s", buf_for_health_report);
+			kfree(buf_for_health_report);
+			seq_printf(s, "[269] Device life time estimation type B, device_life_time_est_typ_b: 0x%02x\n", ext_csd[269]);
+			seq_printf(s, "[268] Device life time estimation type A, device_life_time_est_typ_a: 0x%02x\n", ext_csd[268]);
+			seq_printf(s, "[267] Pre EOL information, pre_eol_info: 0x%02x\n", ext_csd[267]);
+			seq_printf(s, "[266] Optimal read size, optimal_read_size: 0x%02x\n", ext_csd[266]);
+			seq_printf(s, "[265] Optimal write size, optimal_write_size: 0x%02x\n", ext_csd[265]);
+			seq_printf(s, "[264] Optimal trim unit size, optimal_trim_unit_size: 0x%02x\n", ext_csd[264]);
+			seq_printf(s, "[263:262] Device version, device_version: 0x%02x\n", (ext_csd[262] << 0) | (ext_csd[263] << 8));
+			output=0;
+			for (cnt = 261 ; cnt >= 254 ; cnt--)
+				output += snprintf(buf_for_firmwware_version + output, 3, "%02x", ext_csd[cnt]);
+			output += snprintf(buf_for_firmwware_version + output, 2, "\n");
+			seq_printf(s, "[261:254] Firmware version, firmwware_version: %s", buf_for_firmwware_version);
+			kfree(buf_for_firmwware_version);
+			seq_printf(s, "[253] Power class for 200MHz, DDR at VCC=3.6V, pwr_cl_ddr_200_360: 0x%02x\n", ext_csd[253]);
+		}
+		seq_printf(s, "[252:249] Cache size, cache_size %d KiB\n", (ext_csd[249] << 0) |
+                          (ext_csd[250] << 8) | (ext_csd[251] << 16) |
+                          (ext_csd[252] << 24));
+		seq_printf(s, "[248] Generic CMD6 timeout, generic_cmd6_time: 0x%02x\n", ext_csd[248]);
+		seq_printf(s, "[247] Power off notification timeout, power_off_long_time: 0x%02x\n", ext_csd[247]);
+		seq_printf(s, "[246] Background operations status, bkops_status: 0x%02x\n", ext_csd[246]);
+		seq_printf(s, "[245:242] Number of correctly programmed sectors, correctly_prg_sectors_num %d KiB\n", (ext_csd[242] << 0) |
+																						(ext_csd[243] << 8) | (ext_csd[244] << 16) |
+																												(ext_csd[245] << 24));
+       }
+       if (ext_csd_rev >= 5) {
+               seq_printf(s, "[241] 1st initialization time after partitioning, ini_timeout_ap: 0x%02x\n", ext_csd[241]);
+               seq_printf(s, "[239] Power class for 52MHz, DDR at 3.6V, pwr_cl_ddr_52_360: 0x%02x\n", ext_csd[239]);
+               seq_printf(s, "[238] POwer class for 52MHz, DDR at 1.95V, pwr_cl_ddr_52_195: 0x%02x\n", ext_csd[238]);
+               if (ext_csd_rev >= 6) {
+			seq_printf(s, "[237] Power class for 200MHz, SDR at 3.6V, pwr_cl_200_360: 0x%02x\n", ext_csd[237]);
+			seq_printf(s, "[236] Power class for 200MHz, SDR at 1.95V, pwr_cl_200_195: 0x%02x\n", ext_csd[236]);
+               }
+               seq_printf(s, "[235] Minimun Write Performance for 8bit at 52MHz in DDR mode, min_perf_ddr_w_8_52: 0x%02x\n", ext_csd[235]);
+               seq_printf(s, "[234] Minimun Read Performance for 8bit at 52MHz in DDR modemin_perf_ddr_r_8_52: 0x%02x\n", ext_csd[234]);
+               seq_printf(s, "[232] TRIM Multiplier, trim_mult: 0x%02x\n", ext_csd[232]);
+               seq_printf(s, "[231] Secure Feature support, sec_feature_support: 0x%02x\n", ext_csd[231]);
+       }
+	if (ext_csd_rev == 5 || ext_csd_rev == 7) { /* Obsolete in 4.5 */  /*---->revived in 5.0*/
+               seq_printf(s, "[230] Secure Erase Multiplier, sec_erase_mult: 0x%02x\n", ext_csd[230]);
+               seq_printf(s, "[229] Secure TRIM Multiplier, sec_trim_mult:  0x%02x\n", ext_csd[229]);
+       }
+       seq_printf(s, "[228] Boot information, boot_info: 0x%02x\n", ext_csd[228]);
+       seq_printf(s, "[226] Boot partition size, boot_size_mult : 0x%02x\n", ext_csd[226]);
+       seq_printf(s, "[225] Access size, acc_size: 0x%02x\n", ext_csd[225]);
+       seq_printf(s, "[224] High-capacity erase unit size, hc_erase_grp_size: 0x%02x\n", ext_csd[224]);
+       seq_printf(s, "[223] High-capacity erase timeout, erase_timeout_mult: 0x%02x\n", ext_csd[223]);
+       seq_printf(s, "[222] Reliable write sector count, rel_wr_sec_c: 0x%02x\n", ext_csd[222]);
+       seq_printf(s, "[221] High-capacity write protect group size, hc_wp_grp_size: 0x%02x\n", ext_csd[221]);
+       seq_printf(s, "[220] Sleep current(VCC), s_c_vcc: 0x%02x\n", ext_csd[220]);
+       seq_printf(s, "[219] Sleep current(VCCQ), s_c_vccq: 0x%02x\n", ext_csd[219]);
+	if (ext_csd_rev == 7) {
+		seq_printf(s, "[218] Production state awareness timeout, production_state_awareness_timeout: 0x%02x\n", ext_csd[218]);
+	}
+       seq_printf(s, "[217] Sleep/awake timeout, s_a_timeout: 0x%02x\n", ext_csd[217]);
+		if (ext_csd_rev == 7) {
+		seq_printf(s, "[216] Sleep notification timeout, sleep_notification_time: 0x%02x\n", ext_csd[216]);
+	}
+       seq_printf(s, "[215:212] Sector Count, sec_count: 0x%08x\n", (ext_csd[215] << 24) |(ext_csd[214] << 16) | (ext_csd[213] << 8)  | ext_csd[212]);
+       seq_printf(s, "[210] Minimum Write Performance for 8bit at 52MHz, min_perf_w_8_52: 0x%02x\n", ext_csd[210]);
+       seq_printf(s, "[209] Minimum Read Performance for 8bit at 52MHz, min_perf_r_8_52: 0x%02x\n", ext_csd[209]);
+       seq_printf(s, "[208] Minimum Write Performance for 8bit at 26MHz, for 4bit at 52MHz, min_perf_w_8_26_4_52: 0x%02x\n", ext_csd[208]);
+       seq_printf(s, "[207] Minimum Read Performance for 8bit at 26MHz, for 4bit at 52MHz, min_perf_r_8_26_4_52: 0x%02x\n", ext_csd[207]);
+       seq_printf(s, "[206] Minimum Write Performance for 4bit at 26MHz, min_perf_w_4_26: 0x%02x\n", ext_csd[206]);
+       seq_printf(s, "[205] Minimum Read Performance for 4bit at 26MHz, min_perf_r_4_26: 0x%02x\n", ext_csd[205]);
+       seq_printf(s, "[203] Power class for 26MHz at 3.6V, pwr_cl_26_360: 0x%02x\n", ext_csd[203]);
+       seq_printf(s, "[202] Power class for 52MHz at 3.6V, pwr_cl_52_360: 0x%02x\n", ext_csd[202]);
+       seq_printf(s, "[201] Power class for 26MHz at 1.95V, pwr_cl_26_195: 0x%02x\n", ext_csd[201]);
+       seq_printf(s, "[200] Power class for 52MHz at 1.95V, pwr_cl_52_195: 0x%02x\n", ext_csd[200]);
+       if (ext_csd_rev >= 5) {
+               seq_printf(s, "[199] Partition switching timing, partition_switch_time: 0x%02x\n", ext_csd[199]);
+               seq_printf(s, "[198] Out-of-interrupt busy timing, out_of_interrupt_time: 0x%02x\n", ext_csd[198]);
+       }
+       if (ext_csd_rev >= 6)
+		seq_printf(s, "[197] IO Driver Strength, driver_strength: 0x%02x\n", ext_csd[197]);
+	seq_printf(s, "[196] Device type, device_type: 0x%02x\n", ext_csd[196]);
+       seq_printf(s, "[194] CSD structure version, csd_structure: 0x%02x\n", ext_csd[194]);
+       seq_printf(s, "[192] Extended CSD revision, ext_csd_rev: 0x%02x\n", ext_csd[192]);
+       seq_printf(s, "[191] Command set, cmd_set: 0x%02x\n", ext_csd[191]);
+       seq_printf(s, "[189] Command set revision, cmd_set_rev: 0x%02x\n", ext_csd[189]);
+       seq_printf(s, "[187] Power class, power_class: 0x%02x\n", ext_csd[187]);
+       seq_printf(s, "[185] High-speed interface timing, hs_timing: 0x%02x\n", ext_csd[185]);
+       if(ext_csd_rev >= 7)
+		seq_printf(s, "[184] Enhanced strobe support, strobe_support: 0x%02x\n", ext_csd[184]);
+       seq_printf(s, "[181] Erased memory content, erased_mem_cont: 0x%02x\n", ext_csd[181]);
+       seq_printf(s, "[179] Partition configuration, partition_config: 0x%02x\n", ext_csd[179]);
+       seq_printf(s, "[178] Boot config protection, boot_config_prot: 0x%02x\n", ext_csd[178]);
+	seq_printf(s, "[177] Boot bus Conditions, boot_bus_conditions: 0x%02x\n", ext_csd[177]);
+       seq_printf(s, "[175] High-density erase group definition, erase_group_def: 0x%02x\n", ext_csd[175]);
+       if (ext_csd_rev >= 5) {
+		seq_printf(s, "[174] Boot write protection status registers, boot_wp_status: 0x%02x\n", ext_csd[174]);
+               seq_printf(s, "[173] Boot area write protection register, boot_wp: 0x%02x\n", ext_csd[173]);
+               seq_printf(s, "[171] User area write protection register, user_wp: 0x%02x\n", ext_csd[171]);
+               seq_printf(s, "[169] FW configuration, fw_config: 0x%02x\n", ext_csd[169]);
+               seq_printf(s, "[168] RPMB Size, rpmb_size_mult: 0x%02x\n", ext_csd[168]);
+               seq_printf(s, "[167] Write reliability setting register, wr_rel_set: 0x%02x\n", ext_csd[167]);
+               seq_printf(s, "[166] Write reliability parameter register, wr_rel_param: 0x%02x\n", ext_csd[166]);
+               seq_printf(s, "[163] Enable background operations handshake, bkops_en: 0x%02x\n", ext_csd[163]);
+               seq_printf(s, "[162] H/W reset function, rst_n_function: 0x%02x\n", ext_csd[162]);
+		seq_printf(s, "[161] HPI management, hpi_mgmt: 0x%02x\n", ext_csd[161]);
+		seq_printf(s, "[160] Partitioning Support, partitioning_support: 0x%02x\n", ext_csd[160]);
+               seq_printf(s, "[159:157] Max Enhanced Area Size, max_enh_size_mult: 0x%06x\n", (ext_csd[159] << 16) | (ext_csd[158] << 8) |ext_csd[157]);
+               seq_printf(s, "[156] Partitions attribute, partitions_attribute: 0x%02x\n", ext_csd[156]);
+               seq_printf(s, "[155] Partitioning Setting, partition_setting_completed: 0x%02x\n", ext_csd[155]);
+		seq_printf(s, "[154:152] General Purpose Partition Size, gp_size_mult_4: 0x%x\n", (ext_csd[154] << 16) | (ext_csd[153] << 8) | ext_csd[152]);
+		seq_printf(s, "[151:149] General Purpose Partition Size, gp_size_mult_3: 0x%x\n", (ext_csd[151] << 16) | (ext_csd[150] << 8) | ext_csd[149]);
+		seq_printf(s, "[148:146] General Purpose Partition Size, gp_size_mult_2: 0x%x\n", (ext_csd[148] << 16) | (ext_csd[147] << 8) | ext_csd[146]);
+		seq_printf(s, "[145:143] General Purpose Partition Size, gp_size_mult_1: 0x%x\n", (ext_csd[145] << 16) | (ext_csd[144] << 8) | ext_csd[143]);
+		seq_printf(s, "[142:140] Enhanced User Data Area Size, enh_size_mult: 0x%x\n", (ext_csd[142] << 16) | (ext_csd[141] << 8) | ext_csd[140]);
+		seq_printf(s, "[139:136] Enhanced User Data Start Address, enh_start_addr: 0x%x\n", (ext_csd[139] << 24) | (ext_csd[138] << 16) | (ext_csd[137] << 8) | ext_csd[136]);
+               seq_printf(s, "[134] Bad Block Management mode, sec_bad_blk_mgmnt: 0x%02x\n", ext_csd[134]);
+       }
+	if (ext_csd_rev >= 7)
+		seq_printf(s, "[133] Production State Awareness, PRODUCTION_STATE_AWARENESS: 0x%02x\n", ext_csd[133]);
+       if (ext_csd_rev >= 6) {
+               int j;
+		seq_printf(s, "[131] Periodic Wake-up, periodic_wakeup: 0x%02x\n", ext_csd[131]);
+		seq_printf(s, "[130] Program CID CSD in DDR mode support, program_cid_csd_ddr_support: 0x%02x\n",
+                          ext_csd[130]);
+               for (j = 127; j >= 64; j--)
+			seq_printf(s, "[127:64] Vendor Specific Fields, vendor_specific_field[%d]: 0x%02x\n",
+                                  j, ext_csd[j]);
+		seq_printf(s, "[63] Native sector size, native_sector_size: 0x%02x\n", ext_csd[63]);
+		seq_printf(s, "[62] Sector size emulation, use_native_sector: 0x%02x\n", ext_csd[62]);
+		seq_printf(s, "[61] Sector size, data_sector_size: 0x%02x\n", ext_csd[61]);
+		seq_printf(s, "[60] 1st initialization after disabling sector size emulation, ini_timeout_emu: 0x%02x\n", ext_csd[60]);
+		seq_printf(s, "[59] Class 6 commands control, class_6_ctrl: 0x%02x\n", ext_csd[59]);
+		seq_printf(s, "[58] Number of addressed group to be Released, dyncap_needed: 0x%02x\n", ext_csd[58]);
+		seq_printf(s, "[57:56] Exception events control, exception_events_ctrl: 0x%02x\n",
+                          (ext_csd[57] << 8) | ext_csd[56]);
+		seq_printf(s, "[55:54] Exception events status, exception_events_status: 0x%02x\n",
+                          (ext_csd[55] << 8) | ext_csd[54]);
+		seq_printf(s, "[53:52] Extended Partitions Attribute, ext_partitions_attribute: 0x%02x\n",
+                          (ext_csd[53] << 8) | ext_csd[52]);
+               for (j = 51; j >= 37; j--)
+			seq_printf(s, "[51:37]Context configuration, context_conf[%d]: 0x%02x\n", j,
+                                  ext_csd[j]);
+		seq_printf(s, "[36] Packed command status, packed_command_status: 0x%02x\n", ext_csd[36]);
+		seq_printf(s, "[35] Packed command failure index, packed_failure_index: 0x%02x\n", ext_csd[35]);
+		seq_printf(s, "[34] Power Off Notification, power_off_notification: 0x%02x\n", ext_csd[34]);
+		seq_printf(s, "[33] Control to turn the Cache On Off, cache_ctrl: 0x%02x\n", ext_csd[33]);
+       }
+	if (ext_csd_rev >= 7) {
+		seq_printf(s, "[30] Mode Config, MODE_CONFIG: 0x%02x\n", ext_csd[30]);
+		/* mode_operation_codes ext_csd[29] not readable */
+		seq_printf(s, "[26] FFU Status, FFU_STATUS: 0x%02x\n", ext_csd[26]);
+		seq_printf(s, "[25:22] Pre loading Data Size, PRE_LOADING_DATA_SIZE: 0x%08x\n", (ext_csd[22] << 0) | (ext_csd[23] << 8) | (ext_csd[24] << 16) | (ext_csd[25] << 24));
+		seq_printf(s, "[21:18] Max Pre Loading Data Size, MAX_PRE_LOADING_DATA_SIZE: 0x%08x\n", (ext_csd[18] << 0) | (ext_csd[19] << 8) | (ext_csd[20] << 16) | (ext_csd[21] << 24));
+		seq_printf(s, "[17] Product State Awareness Enablement, PRODUCT_STATE_AWARENESS_ENABLEMENT: 0x%02x\n", ext_csd[17]);
+		seq_printf(s, "[16] Secure Removal Type, SECURE_REMOVAL_TYPE: 0x%02x\n", ext_csd[16]);
+	}
+#endif
 out_free:
+#ifndef CONFIG_LFS_MMC
 	kfree(buf);
+#else
+	if (ext_csd)
+		kfree(ext_csd);
+#endif
 	return err;
 }
 
+#ifdef CONFIG_LFS_MMC
+static int mmc_ext_csd_open(struct inode *inode, struct file *file)
+#else
 static ssize_t mmc_ext_csd_read(struct file *filp, char __user *ubuf,
 				size_t cnt, loff_t *ppos)
+#endif
 {
+#ifdef CONFIG_LFS_MMC
+	return single_open(file, mmc_ext_csd_read, inode->i_private);
+#else
 	char *buf = filp->private_data;
 
 	return simple_read_from_buffer(ubuf, cnt, ppos,
@@ -2805,13 +3142,20 @@ static int mmc_ext_csd_release(struct inode *inode, struct file *file)
 {
 	kfree(file->private_data);
 	return 0;
+#endif
 }
 
 static const struct file_operations mmc_dbg_ext_csd_fops = {
 	.open		= mmc_ext_csd_open,
+#ifdef CONFIG_LFS_MMC
+	.read		   = seq_read,
+	.llseek 		= seq_lseek,
+	.release		= single_release,
+#else
 	.read		= mmc_ext_csd_read,
 	.release	= mmc_ext_csd_release,
 	.llseek		= default_llseek,
+#endif
 };
 
 static int mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
@@ -2908,6 +3252,7 @@ static int mmc_blk_probe(struct mmc_card *card)
 
 	dev_set_drvdata(&card->dev, md);
 
+	mmc_set_bus_resume_policy(card->host, 1);
 	if (mmc_add_disk(md))
 		goto out;
 
@@ -2956,6 +3301,7 @@ static void mmc_blk_remove(struct mmc_card *card)
 	pm_runtime_put_noidle(&card->dev);
 	mmc_blk_remove_req(md);
 	dev_set_drvdata(&card->dev, NULL);
+	mmc_set_bus_resume_policy(card->host, 0);
 	destroy_workqueue(card->complete_wq);
 }
 

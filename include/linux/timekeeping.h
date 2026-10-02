@@ -113,6 +113,34 @@ static inline ktime_t ktime_get_coarse_clocktai(void)
 	return ktime_get_coarse_with_offset(TK_OFFS_TAI);
 }
 
+static inline ktime_t ktime_get_coarse(void)
+{
+	struct timespec64 ts;
+
+	ktime_get_coarse_ts64(&ts);
+	return timespec64_to_ktime(ts);
+}
+
+static inline u64 ktime_get_coarse_ns(void)
+{
+	return ktime_to_ns(ktime_get_coarse());
+}
+
+static inline u64 ktime_get_coarse_real_ns(void)
+{
+	return ktime_to_ns(ktime_get_coarse_real());
+}
+
+static inline u64 ktime_get_coarse_boottime_ns(void)
+{
+	return ktime_to_ns(ktime_get_coarse_boottime());
+}
+
+static inline u64 ktime_get_coarse_clocktai_ns(void)
+{
+	return ktime_to_ns(ktime_get_coarse_clocktai());
+}
+
 /**
  * ktime_mono_to_real - Convert monotonic time to clock realtime
  */
@@ -261,6 +289,10 @@ extern void read_persistent_clock64(struct timespec64 *ts);
 void read_persistent_wall_and_boot_offset(struct timespec64 *wall_clock,
 					  struct timespec64 *boot_offset);
 extern int update_persistent_clock64(struct timespec64 now);
+
+#ifdef CONFIG_MACH_LGE
+struct timespec __current_kernel_time(void);
+#endif
 
 /*
  * deprecated aliases, don't use in new code

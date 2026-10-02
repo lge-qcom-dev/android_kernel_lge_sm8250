@@ -117,6 +117,15 @@ static inline struct timespec64 tk_xtime(const struct timekeeper *tk)
 	return ts;
 }
 
+#ifdef CONFIG_MACH_LGE
+struct timespec __current_kernel_time(void)
+{
+	struct timekeeper *tk = &tk_core.timekeeper;
+
+	return timespec64_to_timespec(tk_xtime(tk));
+}
+#endif
+
 static void tk_set_xtime(struct timekeeper *tk, const struct timespec64 *ts)
 {
 	tk->xtime_sec = ts->tv_sec;
@@ -150,6 +159,11 @@ static void tk_set_wall_to_mono(struct timekeeper *tk, struct timespec64 wtm)
 static inline void tk_update_sleep_time(struct timekeeper *tk, ktime_t delta)
 {
 	tk->offs_boot = ktime_add(tk->offs_boot, delta);
+	/*
+	 * Timespec representation for VDSO update to avoid 64bit division
+	 * on every update.
+	 */
+	tk->monotonic_to_boot = ktime_to_timespec64(tk->offs_boot);
 }
 
 /*

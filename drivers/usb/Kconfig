@@ -173,6 +173,8 @@ source "drivers/usb/typec/Kconfig"
 
 source "drivers/usb/roles/Kconfig"
 
+source "drivers/usb/pd/Kconfig"
+
 config USB_LED_TRIG
 	bool "USB LED Triggers"
 	depends on LEDS_CLASS && LEDS_TRIGGERS
@@ -206,3 +208,5 @@ config USB_ULPI_BUS
 	  be called ulpi.
 
 endif # USB_SUPPORT
+
+source "drivers/usb/Kconfig.lge"
